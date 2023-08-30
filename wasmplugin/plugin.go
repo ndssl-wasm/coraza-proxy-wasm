@@ -4,7 +4,6 @@
 package wasmplugin
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -132,6 +131,18 @@ func (ctx *corazaPlugin) OnPluginStart(pluginConfigurationSize int) types.OnPlug
 			// buffering request body to files anyways.
 			WithRootFS(root)
 
+		// conf := coraza.NewWAFConfig().
+		// 	WithErrorCallback(logError).
+		// 	WithDebugLogger(debuglog.Noop()).
+		// 	// TODO(anuraaga): Make this configurable in plugin configuration.
+		// 	// WithRequestBodyLimit(1024 * 1024 * 1024).
+		// 	// WithRequestBodyInMemoryLimit(1024 * 1024 * 1024).
+		// 	// Limit equal to MemoryLimit: TinyGo compilation will prevent
+		// 	// buffering request body to files anyways.
+		// 	WithRootFS(root)
+
+		// 这里好像只是简单把 "Include @demo-conf" 和 "SecDebugLogLevel 9" 这两种字段添加到了 conf 中
+		// wafRule 有三个字段：rule str file，WithDirectives 这里只是添加到 str
 		waf, err := coraza.NewWAF(conf.WithDirectives(strings.Join(directives, "\n")))
 		if err != nil {
 			proxywasm.LogCriticalf("Failed to parse directives: %v", err)
@@ -216,26 +227,28 @@ const (
 type httpContext struct {
 	// Embed the default http context here,
 	// so that we don't need to reimplement all the methods.
-	types.DefaultHttpContext
-	contextID             uint32
-	perAuthorityWAFs      wafMap
-	tx                    ctypes.Transaction
-	httpProtocol          string
-	processedRequestBody  bool
-	processedResponseBody bool
-	bodyReadIndex         int
-	metrics               *wafMetrics
-	interruptedAt         interruptionPhase
-	logger                debuglog.Logger
-	metricLabelsKV        []string
+	types.DefaultHttpContext // proxy-wasm-go-sdk
+	contextID                uint32
+	perAuthorityWAFs         wafMap
+	tx                       ctypes.Transaction
+	httpProtocol             string
+	processedRequestBody     bool
+	processedResponseBody    bool
+	bodyReadIndex            int
+	metrics                  *wafMetrics
+	interruptedAt            interruptionPhase
+	logger                   debuglog.Logger
+	metricLabelsKV           []string
 }
 
 func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) types.Action {
 	defer logTime("OnHttpRequestHeaders", currentTime())
 
-	ctx.metrics.CountTX()
+	fmt.Println("ihnfsax: OnHttpRequestHeaders")
 
-	authority, err := proxywasm.GetHttpRequestHeader(":authority")
+	ctx.metrics.CountTX() // 这个好像是统计总的请求数
+
+	authority, err := proxywasm.GetHttpRequestHeader(":authority") // 获取伪首部
 	if err != nil {
 		proxywasm.LogDebugf("Failed to get the :authority pseudo-header: %v", err)
 		propHostRaw, propHostErr := proxywasm.GetProperty([]string{"request", "host"})
@@ -245,9 +258,21 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		}
 		authority = string(propHostRaw)
 	}
+
+	// perAuthorityWAFs 会保存一个 authority:waf 的 map，以及一个 defaultWAF
 	if waf, isDefault, resolveWAFErr := ctx.perAuthorityWAFs.getWAFOrDefault(authority); resolveWAFErr == nil {
+		// 成功找到了 waf
+
+		// WAF 实例用于存储配置和规则
+		// 每个网络应用程序应该有一个不同的WAF实例，
+		// 但如果您愿意共享配置、规则和日志，可以共享一个实例。
+		// Transaction 和 SecLang 解析器需要一个WAF实例
+		// 您可以使用任意多个WAF实例，并且它们是并发安全的。
+
+		// NewTransaction 在该 WAF 实例上创建一个新的已初始化的事务
 		ctx.tx = waf.NewTransaction()
 
+		// 这里是往日志注册了一个分类字段，由 context_id 和 authority 组成
 		logFields := []debuglog.ContextField{debuglog.Uint("context_id", uint(ctx.contextID))}
 		if !isDefault {
 			logFields = append(logFields, debuglog.Str("authority", authority))
@@ -255,7 +280,10 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		ctx.logger = ctx.tx.DebugLogger().With(logFields...)
 
 		// CRS rules tend to expect Host even with HTTP/2
+		// 手动添加 Host 头部字段
 		ctx.tx.AddRequestHeader("Host", authority)
+		// parseServerName 会把 authority 的 Host 和 Port 分开，并返回 Host
+		// CRS 要检查 SERVER_NAME 变量，这是在设置
 		ctx.tx.SetServerName(parseServerName(ctx.logger, authority))
 
 		if !isDefault {
@@ -266,7 +294,7 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		return types.ActionContinue
 	}
 
-	tx := ctx.tx
+	tx := ctx.tx // ctypes.Transaction
 
 	// This currently relies on Envoy's behavior of mapping all requests to HTTP/2 semantics
 	// and its request properties, but they may not be true of other proxies implementing
@@ -276,8 +304,13 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 	}
 
 	// OnHttpRequestHeaders does not terminate if IP/Port retrieve goes wrong
+	// 获取 source.address 和 source.port 属性
 	srcIP, srcPort := retrieveAddressInfo(ctx.logger, "source")
+	// 获取 destination.address 和 destination.port 属性
 	dstIP, dstPort := retrieveAddressInfo(ctx.logger, "destination")
+
+	fmt.Printf("srcIP: %s, srcPort: %d", srcIP, srcPort)
+	fmt.Printf("dstIP: %s, dstPort: %d", dstIP, dstPort)
 
 	tx.ProcessConnection(srcIP, srcPort, dstIP, dstPort)
 
@@ -313,6 +346,7 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		method = string(propMethodRaw)
 	}
 
+	// 获取 request.protocol 属性（“HTTP/1.0”, “HTTP/1.1”, “HTTP/2”, or “HTTP/3”）
 	protocol, err := proxywasm.GetProperty([]string{"request", "protocol"})
 	if err != nil {
 		// TODO(anuraaga): HTTP protocol is commonly required in WAF rules, we should probably
@@ -322,6 +356,7 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 
 	ctx.httpProtocol = string(protocol)
 
+	// 分析 URI 和 query 字段
 	tx.ProcessURI(uri, method, ctx.httpProtocol)
 
 	hs, err := proxywasm.GetHttpRequestHeaders()
@@ -330,12 +365,15 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		return types.ActionContinue
 	}
 
+	// 把所有 request headers 喂给 Coraza？
 	for _, h := range hs {
 		tx.AddRequestHeader(h[0], h[1])
 	}
 
+	// 分析请求头
 	interruption := tx.ProcessRequestHeaders()
 	if interruption != nil {
+		fmt.Println("ihnfsax: Interruption happens when processing request headers")
 		return ctx.handleInterruption(interruptionPhaseHttpRequestHeaders, interruption)
 	}
 
@@ -344,6 +382,8 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 
 func (ctx *httpContext) OnHttpRequestBody(bodySize int, endOfStream bool) types.Action {
 	defer logTime("OnHttpRequestBody", currentTime())
+
+	fmt.Println("ihnfsax: OnHttpRequestBody")
 
 	if ctx.interruptedAt.isInterrupted() {
 		ctx.logger.Error().
@@ -436,208 +476,212 @@ func (ctx *httpContext) OnHttpRequestBody(bodySize int, endOfStream bool) types.
 	return types.ActionPause
 }
 
-func (ctx *httpContext) OnHttpResponseHeaders(numHeaders int, endOfStream bool) types.Action {
-	defer logTime("OnHttpResponseHeaders", currentTime())
+// func (ctx *httpContext) OnHttpResponseHeaders(numHeaders int, endOfStream bool) types.Action {
+// 	defer logTime("OnHttpResponseHeaders", currentTime())
 
-	if ctx.interruptedAt.isInterrupted() {
-		// Handling the interruption (see handleInterruption) generates a HttpResponse with the required interruption status code.
-		// If handleInterruption is raised during OnHttpRequestHeaders or OnHttpRequestBody, the crafted response is sent
-		// downstream via the filter chain, therefore OnHttpResponseHeaders is called. It has to continue to properly send back the interruption action.
-		// A doublecheck might be eventually added, checking that the :status header matches the expected interruption status code.
-		// See https://github.com/corazawaf/coraza-proxy-wasm/pull/126
-		ctx.logger.Debug().
-			Str("interruption_handled_phase", ctx.interruptedAt.String()).
-			Msg("Interruption already handled, sending downstream the local response")
-		return types.ActionContinue
-	}
+// 	fmt.Println("ihnfsax: OnHttpResponseHeaders")
 
-	if ctx.tx == nil {
-		return types.ActionContinue
-	}
+// 	if ctx.interruptedAt.isInterrupted() {
+// 		// Handling the interruption (see handleInterruption) generates a HttpResponse with the required interruption status code.
+// 		// If handleInterruption is raised during OnHttpRequestHeaders or OnHttpRequestBody, the crafted response is sent
+// 		// downstream via the filter chain, therefore OnHttpResponseHeaders is called. It has to continue to properly send back the interruption action.
+// 		// A doublecheck might be eventually added, checking that the :status header matches the expected interruption status code.
+// 		// See https://github.com/corazawaf/coraza-proxy-wasm/pull/126
+// 		ctx.logger.Debug().
+// 			Str("interruption_handled_phase", ctx.interruptedAt.String()).
+// 			Msg("Interruption already handled, sending downstream the local response")
+// 		return types.ActionContinue
+// 	}
 
-	tx := ctx.tx
+// 	if ctx.tx == nil {
+// 		return types.ActionContinue
+// 	}
 
-	if tx.IsRuleEngineOff() {
-		return types.ActionContinue
-	}
+// 	tx := ctx.tx
 
-	// Requests without body won't call OnHttpRequestBody, but there are rules in the request body
-	// phase that still need to be executed. If they haven't been executed yet, now is the time.
-	if !ctx.processedRequestBody {
-		ctx.processedRequestBody = true
-		interruption, err := tx.ProcessRequestBody()
-		if err != nil {
-			ctx.logger.Error().
-				Err(err).Msg("Failed to process request body")
-			return types.ActionContinue
-		}
-		if interruption != nil {
-			return ctx.handleInterruption(interruptionPhaseHttpResponseHeaders, interruption)
-		}
-	}
+// 	if tx.IsRuleEngineOff() {
+// 		return types.ActionContinue
+// 	}
 
-	status, err := proxywasm.GetHttpResponseHeader(":status")
-	if err != nil {
-		ctx.logger.Error().
-			Err(err).
-			Msg("Failed to get :status")
-		propCodeRaw, propCodeErr := proxywasm.GetProperty([]string{"response", "code"})
-		if propCodeErr != nil {
-			ctx.logger.Error().
-				Err(propCodeErr).
-				Msg("Failed to get property of code of the response")
-			return types.ActionContinue
-		}
-		status = string(propCodeRaw)
-	}
-	code, err := strconv.Atoi(status)
-	if err != nil {
-		code = 0
-	}
+// 	// Requests without body won't call OnHttpRequestBody, but there are rules in the request body
+// 	// phase that still need to be executed. If they haven't been executed yet, now is the time.
+// 	if !ctx.processedRequestBody {
+// 		ctx.processedRequestBody = true
+// 		interruption, err := tx.ProcessRequestBody()
+// 		if err != nil {
+// 			ctx.logger.Error().
+// 				Err(err).Msg("Failed to process request body")
+// 			return types.ActionContinue
+// 		}
+// 		if interruption != nil {
+// 			return ctx.handleInterruption(interruptionPhaseHttpResponseHeaders, interruption)
+// 		}
+// 	}
 
-	hs, err := proxywasm.GetHttpResponseHeaders()
-	if err != nil {
-		ctx.logger.Error().
-			Err(err).
-			Msg("Failed to get response headers")
-		return types.ActionContinue
-	}
+// 	status, err := proxywasm.GetHttpResponseHeader(":status")
+// 	if err != nil {
+// 		ctx.logger.Error().
+// 			Err(err).
+// 			Msg("Failed to get :status")
+// 		propCodeRaw, propCodeErr := proxywasm.GetProperty([]string{"response", "code"})
+// 		if propCodeErr != nil {
+// 			ctx.logger.Error().
+// 				Err(propCodeErr).
+// 				Msg("Failed to get property of code of the response")
+// 			return types.ActionContinue
+// 		}
+// 		status = string(propCodeRaw)
+// 	}
+// 	code, err := strconv.Atoi(status)
+// 	if err != nil {
+// 		code = 0
+// 	}
 
-	for _, h := range hs {
-		tx.AddResponseHeader(h[0], h[1])
-	}
+// 	hs, err := proxywasm.GetHttpResponseHeaders()
+// 	if err != nil {
+// 		ctx.logger.Error().
+// 			Err(err).
+// 			Msg("Failed to get response headers")
+// 		return types.ActionContinue
+// 	}
 
-	interruption := tx.ProcessResponseHeaders(code, ctx.httpProtocol)
-	if interruption != nil {
-		return ctx.handleInterruption(interruptionPhaseHttpResponseHeaders, interruption)
-	}
+// 	for _, h := range hs {
+// 		tx.AddResponseHeader(h[0], h[1])
+// 	}
 
-	return types.ActionContinue
-}
+// 	interruption := tx.ProcessResponseHeaders(code, ctx.httpProtocol)
+// 	if interruption != nil {
+// 		return ctx.handleInterruption(interruptionPhaseHttpResponseHeaders, interruption)
+// 	}
 
-func (ctx *httpContext) OnHttpResponseBody(bodySize int, endOfStream bool) types.Action {
-	defer logTime("OnHttpResponseBody", currentTime())
+// 	return types.ActionContinue
+// }
 
-	if ctx.interruptedAt.isInterrupted() {
-		// At response body phase, proxy-wasm currently relies on emptying the response body as a way of
-		// interruption the response. See https://github.com/corazawaf/coraza-proxy-wasm/issues/26.
-		// If OnHttpResponseBody is called again and an interruption has already been raised, it means that
-		// we have to keep going with the sanitization of the response, emptying it.
-		// Sending the crafted HttpResponse with empty body, we don't expect to trigger OnHttpResponseBody
-		ctx.logger.Debug().
-			Str("interruption_handled_phase", ctx.interruptedAt.String()).
-			Msg("Response body interruption already handled, keeping replacing the body")
-		// Interruption happened, we don't want to send response body data
-		return replaceResponseBodyWhenInterrupted(ctx.logger, bodySize)
-	}
+// func (ctx *httpContext) OnHttpResponseBody(bodySize int, endOfStream bool) types.Action {
+// 	defer logTime("OnHttpResponseBody", currentTime())
 
-	if ctx.tx == nil {
-		return types.ActionContinue
-	}
+// 	fmt.Println("ihnfsax: OnHttpResponseBody")
 
-	tx := ctx.tx
+// 	if ctx.interruptedAt.isInterrupted() {
+// 		// At response body phase, proxy-wasm currently relies on emptying the response body as a way of
+// 		// interruption the response. See https://github.com/corazawaf/coraza-proxy-wasm/issues/26.
+// 		// If OnHttpResponseBody is called again and an interruption has already been raised, it means that
+// 		// we have to keep going with the sanitization of the response, emptying it.
+// 		// Sending the crafted HttpResponse with empty body, we don't expect to trigger OnHttpResponseBody
+// 		ctx.logger.Debug().
+// 			Str("interruption_handled_phase", ctx.interruptedAt.String()).
+// 			Msg("Response body interruption already handled, keeping replacing the body")
+// 		// Interruption happened, we don't want to send response body data
+// 		return replaceResponseBodyWhenInterrupted(ctx.logger, bodySize)
+// 	}
 
-	if tx.IsRuleEngineOff() {
-		return types.ActionContinue
-	}
+// 	if ctx.tx == nil {
+// 		return types.ActionContinue
+// 	}
 
-	// Do not perform any action related to response body data if SecResponseBodyAccess is set to false
-	if !tx.IsResponseBodyAccessible() {
-		ctx.logger.Debug().Msg("Skipping response body inspection, SecResponseBodyAccess is off.")
-		// ProcessResponseBody is performed for phase 4 rules, checking already populated variables
-		if !ctx.processedResponseBody {
-			interruption, err := tx.ProcessResponseBody()
-			if err != nil {
-				ctx.logger.Error().Err(err).Msg("Failed to process response body")
-				return types.ActionContinue
-			}
-			ctx.processedResponseBody = true
-			if interruption != nil {
-				// Proxy-wasm can not anymore deny the response. The best interruption is emptying the body
-				// Coraza Multiphase evaluation will help here avoiding late interruptions
-				ctx.bodyReadIndex = bodySize // hacky: bodyReadIndex stores the body size that has to be replaced
-				return ctx.handleInterruption(interruptionPhaseHttpResponseBody, interruption)
-			}
-		}
-		return types.ActionContinue
-	}
+// 	tx := ctx.tx
 
-	if bodySize > 0 {
-		body, err := proxywasm.GetHttpResponseBody(ctx.bodyReadIndex, bodySize)
-		if err == nil {
-			interruption, _, err := tx.WriteResponseBody(body)
-			if err != nil {
-				ctx.logger.Error().Err(err).Msg("Failed to write response body")
-				return types.ActionContinue
-			}
-			// bodyReadIndex has to be updated before evaluating the interruption
-			// it is internally needed to replace the full body if the tx is interrupted
-			ctx.bodyReadIndex += bodySize
-			if interruption != nil {
-				return ctx.handleInterruption(interruptionPhaseHttpResponseBody, interruption)
-			}
-		} else if err != types.ErrorStatusNotFound {
-			ctx.logger.Error().
-				Int("body_read_index", ctx.bodyReadIndex).
-				Int("body_size", bodySize).
-				Err(err).
-				Msg("Failed to read response body")
-			return types.ActionContinue
-		}
-	}
+// 	if tx.IsRuleEngineOff() {
+// 		return types.ActionContinue
+// 	}
 
-	if endOfStream {
-		// We have already sent response headers, an unauthorized response can not be sent anymore,
-		// but we can still drop the response to prevent leaking sensitive content.
-		// The error will also be logged by Coraza.
-		ctx.processedResponseBody = true
-		interruption, err := tx.ProcessResponseBody()
-		if err != nil {
-			ctx.logger.Error().
-				Err(err).
-				Msg("Failed to process response body")
-			return types.ActionContinue
-		}
-		if interruption != nil {
-			return ctx.handleInterruption(interruptionPhaseHttpResponseBody, interruption)
-		}
-		return types.ActionContinue
-	}
-	// Wait until we see the entire body. It has to be buffered in order to check that it is fully legit
-	// before sending it downstream
-	return types.ActionPause
-}
+// 	// Do not perform any action related to response body data if SecResponseBodyAccess is set to false
+// 	if !tx.IsResponseBodyAccessible() {
+// 		ctx.logger.Debug().Msg("Skipping response body inspection, SecResponseBodyAccess is off.")
+// 		// ProcessResponseBody is performed for phase 4 rules, checking already populated variables
+// 		if !ctx.processedResponseBody {
+// 			interruption, err := tx.ProcessResponseBody()
+// 			if err != nil {
+// 				ctx.logger.Error().Err(err).Msg("Failed to process response body")
+// 				return types.ActionContinue
+// 			}
+// 			ctx.processedResponseBody = true
+// 			if interruption != nil {
+// 				// Proxy-wasm can not anymore deny the response. The best interruption is emptying the body
+// 				// Coraza Multiphase evaluation will help here avoiding late interruptions
+// 				ctx.bodyReadIndex = bodySize // hacky: bodyReadIndex stores the body size that has to be replaced
+// 				return ctx.handleInterruption(interruptionPhaseHttpResponseBody, interruption)
+// 			}
+// 		}
+// 		return types.ActionContinue
+// 	}
 
-func (ctx *httpContext) OnHttpStreamDone() {
-	defer logTime("OnHttpStreamDone", currentTime())
-	tx := ctx.tx
+// 	if bodySize > 0 {
+// 		body, err := proxywasm.GetHttpResponseBody(ctx.bodyReadIndex, bodySize)
+// 		if err == nil {
+// 			interruption, _, err := tx.WriteResponseBody(body)
+// 			if err != nil {
+// 				ctx.logger.Error().Err(err).Msg("Failed to write response body")
+// 				return types.ActionContinue
+// 			}
+// 			// bodyReadIndex has to be updated before evaluating the interruption
+// 			// it is internally needed to replace the full body if the tx is interrupted
+// 			ctx.bodyReadIndex += bodySize
+// 			if interruption != nil {
+// 				return ctx.handleInterruption(interruptionPhaseHttpResponseBody, interruption)
+// 			}
+// 		} else if err != types.ErrorStatusNotFound {
+// 			ctx.logger.Error().
+// 				Int("body_read_index", ctx.bodyReadIndex).
+// 				Int("body_size", bodySize).
+// 				Err(err).
+// 				Msg("Failed to read response body")
+// 			return types.ActionContinue
+// 		}
+// 	}
 
-	if tx != nil {
-		if !tx.IsRuleEngineOff() && !ctx.interruptedAt.isInterrupted() {
-			// Responses without body won't call OnHttpResponseBody, but there are rules in the response body
-			// phase that still need to be executed. If they haven't been executed yet, and there has not been a previous
-			// interruption, now is the time.
-			if !ctx.processedResponseBody {
-				ctx.logger.Info().Msg("Running ProcessResponseBody in OnHttpStreamDone, triggered actions will not be enforced. Further logs are for detection only purposes")
-				ctx.processedResponseBody = true
-				_, err := tx.ProcessResponseBody()
-				if err != nil {
-					ctx.logger.Error().
-						Err(err).
-						Msg("Failed to process response body")
-				}
-			}
-		}
+// 	if endOfStream {
+// 		// We have already sent response headers, an unauthorized response can not be sent anymore,
+// 		// but we can still drop the response to prevent leaking sensitive content.
+// 		// The error will also be logged by Coraza.
+// 		ctx.processedResponseBody = true
+// 		interruption, err := tx.ProcessResponseBody()
+// 		if err != nil {
+// 			ctx.logger.Error().
+// 				Err(err).
+// 				Msg("Failed to process response body")
+// 			return types.ActionContinue
+// 		}
+// 		if interruption != nil {
+// 			return ctx.handleInterruption(interruptionPhaseHttpResponseBody, interruption)
+// 		}
+// 		return types.ActionContinue
+// 	}
+// 	// Wait until we see the entire body. It has to be buffered in order to check that it is fully legit
+// 	// before sending it downstream
+// 	return types.ActionPause
+// }
 
-		// ProcessLogging is still called even if RuleEngine is off for potential logs generated before the engine is turned off.
-		// Internally, if the engine is off, no log phase rules are evaluated
-		ctx.tx.ProcessLogging()
+// func (ctx *httpContext) OnHttpStreamDone() {
+// 	defer logTime("OnHttpStreamDone", currentTime())
+// 	tx := ctx.tx
 
-		_ = ctx.tx.Close()
-		ctx.logger.Info().Msg("Finished")
-		logMemStats()
-	}
-}
+// 	if tx != nil {
+// 		if !tx.IsRuleEngineOff() && !ctx.interruptedAt.isInterrupted() {
+// 			// Responses without body won't call OnHttpResponseBody, but there are rules in the response body
+// 			// phase that still need to be executed. If they haven't been executed yet, and there has not been a previous
+// 			// interruption, now is the time.
+// 			if !ctx.processedResponseBody {
+// 				ctx.logger.Info().Msg("Running ProcessResponseBody in OnHttpStreamDone, triggered actions will not be enforced. Further logs are for detection only purposes")
+// 				ctx.processedResponseBody = true
+// 				_, err := tx.ProcessResponseBody()
+// 				if err != nil {
+// 					ctx.logger.Error().
+// 						Err(err).
+// 						Msg("Failed to process response body")
+// 				}
+// 			}
+// 		}
+
+// 		// ProcessLogging is still called even if RuleEngine is off for potential logs generated before the engine is turned off.
+// 		// Internally, if the engine is off, no log phase rules are evaluated
+// 		ctx.tx.ProcessLogging()
+
+// 		_ = ctx.tx.Close()
+// 		ctx.logger.Info().Msg("Finished")
+// 		logMemStats()
+// 	}
+// }
 
 const noGRPCStream int32 = -1
 const defaultInterruptionStatusCode int = 403
@@ -664,7 +708,7 @@ func (ctx *httpContext) handleInterruption(phase interruptionPhase, interruption
 	if statusCode == 0 {
 		statusCode = defaultInterruptionStatusCode
 	}
-	if err := proxywasm.SendHttpResponse(uint32(statusCode), nil, nil, noGRPCStream); err != nil {
+	if err := proxywasm.SendHttpResponse(uint32(statusCode), nil, []byte("denied by waf"), noGRPCStream); err != nil {
 		panic(err)
 	}
 
@@ -757,7 +801,8 @@ func parsePort(b []byte) (int, error) {
 func replaceResponseBodyWhenInterrupted(logger debuglog.Logger, bodySize int) types.Action {
 	// TODO(M4tteoP): Update response body interruption logic after https://github.com/corazawaf/coraza-proxy-wasm/issues/26
 	// Currently returns a body filled with null bytes that replaces the sensitive data potentially leaked
-	err := proxywasm.ReplaceHttpResponseBody(bytes.Repeat([]byte("\x00"), bodySize))
+	// err := proxywasm.ReplaceHttpResponseBody(bytes.Repeat([]byte("\x00"), bodySize))
+	err := proxywasm.ReplaceHttpResponseBody([]byte("denied by waf"))
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to replace response body")
 		return types.ActionContinue

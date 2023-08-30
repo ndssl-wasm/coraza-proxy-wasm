@@ -18,6 +18,19 @@ type pluginConfiguration struct {
 	perAuthorityDirectives map[string]string
 }
 
+// {
+// 	"directives_map": {
+// 		"default": [
+// 			"Include @demo-conf",
+// 			"SecDebugLogLevel 9",
+// 			"SecRuleEngine On",
+// 			"Include @crs-setup-demo-conf",
+// 			"Include @owasp_crs/*.conf"
+// 		]
+// 	},
+// 	"default_directives": "default"
+// }
+
 type DirectivesMap map[string][]string
 
 func parsePluginConfiguration(data []byte, infoLogger func(string)) (pluginConfiguration, error) {
